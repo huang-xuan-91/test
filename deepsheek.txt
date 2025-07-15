@@ -1,0 +1,418 @@
+这是一个实现updater小系统的单buffer显示的底层代码设计，我现在需要增加一个双buffer显示的逻辑，当满足条件：如果rotation属性为90或180，则使用双buffer，否则使用单buffer显示
+
+根据需求，我们需要在满足条件（旋转角度为90或180度）时使用双缓冲，否则使用单缓冲。目前代码中，无论是DrmDriver还是FbdevDriver，都只使用了一个缓冲区（单缓冲）。我们需要修改这些驱动以支持双缓冲。
+ 设计思路：
+ 1. 在GraphicDrv接口中增加双缓冲相关的函数，例如：AllocateDoubleBuffer, SwapBuffer等，但考虑到改动最小，我们可以通过扩展现有的Flip函数或增加新的双缓冲机制。
+ 2. 由于目前Flip函数每次都是将传入的buf旋转后直接显示（单缓冲），对于双缓冲，我们需要两个缓冲区：一个用于绘制（后台缓冲区），一个用于显示（前台缓冲区）。当一帧绘制完成后，交换两个缓冲区（即SwapBuffer），然后将前台缓冲区的内容显示出来。
+ 3. 但是，观察现有的Flip函数，在DrmDriver和FbdevDriver中，Flip函数都是将传入的buf旋转后复制到驱动内部的缓冲区（buff_）然后显示。在双缓冲模式下，我们需要两个这样的内部缓冲区，并且Flip函数应该交换这两个缓冲区（或者使用一个索引来切换）。
+ 然而，考虑到时间，我们可以这样调整：
+   - 在GraphicDrv基类中增加一个虚函数SetDoubleBuffer(bool enable)用于启用双缓冲（如果需要的话）。
+   - 在具体的驱动（DrmDriver和FbdevDriver）中，增加双缓冲的支持。当启用双缓冲时，内部维护两个缓冲区，并在Flip时交换。
+ 但是，由于需求是只在特定旋转角度（90或180）使用双缓冲，这个条件判断应该放在上层（例如在GraphicEngine中），然后通知底层驱动是否启用双缓冲。
+ 然而，由于时间有限，我们也可以选择在底层驱动中根据旋转角度自行决定是否使用双缓冲。但是旋转角度是在UiRotation中设置的，而驱动层并不知道旋转角度。
+ 因此，我们需要在上层（比如SurfaceDev或GraphicEngine）判断旋转角度，然后通知底层驱动是否使用双缓冲。
+ 但是，为了减少改动范围，我们可以在底层驱动的初始化过程中，通过外部设置的旋转角度来决定是否使用双缓冲。或者，我们修改驱动的初始化，传入旋转角度。
+ 考虑到时间，我们选择在GraphicEngine中判断旋转角度，然后通过GraphicDrv的某个接口设置双缓冲模式。
+ 具体步骤：
+ 1. 在GraphicDrv类中增加一个虚函数：virtual void SetDoubleBuffer(bool enable) = 0; 并在每个驱动中实现它。
+ 2. 在GraphicEngine::Init中，在初始化驱动后，根据旋转角度（degree_）判断是否启用双缓冲。注意，旋转角度是在UiRotation中设置的，而GraphicEngine中已经调用了UiRotation::InitRotation，所以我们可以通过UiRotation::GetInstance().GetDegree()来获取旋转角度。
+ 3. 在DrmDriver和FbdevDriver中，实现SetDoubleBuffer函数，用于设置双缓冲模式。同时，在驱动内部，如果启用双缓冲，则需要分配两个缓冲区，并维护一个当前前台缓冲区的索引。在Flip时，将传入的buf旋转到后台缓冲区，然后交换前后台缓冲区，并将新的前台缓冲区显示出来。
+ 但是，由于FbdevDriver可能不支持双缓冲（framebuffer通常只有一个缓冲区，双缓冲需要两个framebuffer），而DrmDriver可以支持多缓冲。
+ 因此，我们需要分别处理：
+ 对于DrmDriver：
+   - 在ModesetCreateFb中，如果启用双缓冲，则创建两个BufferObject（bo1和bo2）。
+   - 在Flip时，如果启用双缓冲，则将传入的buf旋转到后台缓冲区（比如当前不是显示的那个缓冲区），然后通过drmModeSetCrtc或drmModePageFlip切换显示缓冲区。
+ 对于FbdevDriver：
+   - 双缓冲的实现可能需要两个framebuffer，但标准的fbdev可能不支持。我们可以使用两个缓冲区，然后通过mmap映射两个缓冲区，然后通过FBIOPAN_DISPLAY来切换（这需要framebuffer支持双缓冲，即虚拟分辨率是实际分辨率的两倍？）。但是，由于fbdev驱动本身可能不支持，我们这里暂时不考虑fbdev的双缓冲，只对DRM实现双缓冲。
+ 考虑到时间，我们只对DRM驱动实现双缓冲，并且只针对旋转90或180度的情况。对于fbdev，即使旋转90或180度，仍然使用单缓冲（因为fbdev可能不支持双缓冲，而且我们的设备可能主要使用DRM）。
+ 具体修改：
+ 1. 在GraphicDrv基类中增加一个纯虚函数SetDoubleBuffer，默认实现可以什么都不做（但为了统一，我们还是在两个驱动中都实现它）。
+   由于FbdevDriver不支持双缓冲，我们在FbdevDriver中的SetDoubleBuffer可以忽略（或者打印一条日志）。
+ 2. 在DrmDriver中：
+    - 增加成员变量：bool doubleBufferEnabled_（初始为false）; 两个BufferObject（buff0_和buff1_）; 当前显示的缓冲区索引（currentFrontBuffer_，0表示buff0_，1表示buff1_）。
+    - 在SetDoubleBuffer函数中，设置doubleBufferEnabled_标志，并在初始化时根据这个标志创建两个缓冲区（如果启用双缓冲）还是只创建一个。
+    - 修改Flip函数：如果启用双缓冲，则将传入的buf旋转到后台缓冲区（即非当前显示的缓冲区），然后交换缓冲区（更新currentFrontBuffer_），并将新的前台缓冲区设置为显示（使用drmModeSetCrtc或drmModePageFlip）。
+    - 注意：在双缓冲模式下，需要两个framebuffer id，并且每次Flip时切换显示。
+ 3. 在GraphicEngine::Init函数中，在初始化驱动后，获取旋转角度，如果角度是90或180，则调用drv->SetDoubleBuffer(true); 否则false。
+ 4. 修改DrmDriver的初始化过程：在DrmInit中，如果启用双缓冲，则创建两个framebuffer；否则创建一个。
+ 5. 注意：双缓冲模式下，退出时要销毁两个缓冲区。
+ 由于代码量较大，我们分步骤修改。
+ 由于时间关系，这里只给出DrmDriver的修改方案，FbdevDriver暂时不做双缓冲支持。
+ 下面开始修改代码：
+ 注意：由于我们只修改DRM驱动，且只针对旋转90和180度，所以在上层设置双缓冲时，只对DRM驱动有效。
+ 具体代码修改如下：
+ 1. 在graphic_drv.h中，GraphicDrv类增加虚函数SetDoubleBuffer：
+
+为了增加双缓冲显示逻辑，当旋转角度为90或180度时使用双缓冲，否则使用单缓冲，我们需要修改以下文件：
+
+
+
+### 修改思路：
+1. 在`UiRotation`类中增加获取旋转角度的方法
+2. 在`GraphicEngine`中根据旋转角度决定使用单/双缓冲
+3. 在`DrmDriver`和`FbdevDriver`中实现双缓冲逻辑
+4. 修改`SurfaceDev`以支持双缓冲配置
+
+### 具体修改：
+
+#### 1. ui_rotation.h
+增加获取旋转角度的方法：
+```cpp
+// ui_rotation.h
+class UiRotation final {
+public:
+    // ... 现有代码 ...
+    UI_ROTATION_DEGREE GetDegree() const;  // 新增方法
+private:
+    UI_ROTATION_DEGREE degree_ {UI_ROTATION_DEGREE::UI_ROTATION_0};
+};
+```
+
+#### 2. ui_rotation.cpp
+实现`GetDegree()`方法：
+```cpp
+// ui_rotation.cpp
+UI_ROTATION_DEGREE UiRotation::GetDegree() const
+{
+    return degree_;
+}
+```
+
+#### 3. graphic_engine.h
+在`GraphicEngine`中添加双缓冲相关成员：
+```cpp
+// graphic_engine.h
+class GraphicEngine : public OHOS::SoftEngine {
+private:
+    // ... 现有成员 ...
+    std::unique_ptr<uint8_t[]> doubleBuffer_ = nullptr; // 双缓冲后台缓冲区
+    bool useDoubleBuffer_ = false; // 是否使用双缓冲
+};
+```
+
+#### 4. graphic_engine.cpp
+修改`GetFBBufferInfo()`和`Flush()`：
+```cpp
+// graphic_engine.cpp
+OHOS::BufferInfo *GraphicEngine::GetFBBufferInfo()
+{
+    // ... 现有代码 ...
+    
+    // 检查是否需要双缓冲
+    auto& rotation = UiRotation::GetInstance();
+    UI_ROTATION_DEGREE degree = rotation.GetDegree();
+    useDoubleBuffer_ = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                        degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+    
+    // 分配缓冲区
+    uint32_t bufferSize = width_ * height_ * pixelBytes;
+    if (useDoubleBuffer_) {
+        doubleBuffer_ = std::make_unique<uint8_t[]>(bufferSize);
+        virAddr_ = std::make_unique<uint8_t[]>(bufferSize);
+    } else {
+        virAddr_ = std::make_unique<uint8_t[]>(bufferSize);
+    }
+    
+    // ... 设置buffInfo_ ...
+}
+
+void GraphicEngine::Flush(const OHOS::Rect& flushRect)
+{
+    if ((sfDev_ == nullptr) || (buffInfo_ == nullptr)) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock {mtx_};
+    UiRotation::GetInstance().SetFlushRange(flushRect);
+    
+    if (useDoubleBuffer_) {
+        // 双缓冲：先渲染到后台缓冲区，然后交换
+        UiRotation::GetInstance().RotateBuffer(
+            doubleBuffer_.get(), 
+            reinterpret_cast<uint8_t*>(buffInfo_->virAddr), 
+            buffInfo_->stride * buffInfo_->height
+        );
+        std::swap(virAddr_, doubleBuffer_);
+        buffInfo_->virAddr = virAddr_.get();
+    }
+    
+    sfDev_->Flip(reinterpret_cast<uint8_t*>(buffInfo_->virAddr));
+}
+```
+
+#### 5. drm_driver.h
+修改`DrmDriver`支持双缓冲：
+```cpp
+// drm_driver.h
+class DrmDriver : public GraphicDrv {
+private:
+    struct BufferObject buff_ {};      // 前台缓冲区
+    struct BufferObject backBuff_ {};  // 后台缓冲区（新增）
+    bool useDoubleBuffer_ = false;     // 是否使用双缓冲
+};
+```
+
+#### 6. drm_driver.cpp
+实现双缓冲逻辑：
+```cpp
+// drm_driver.cpp
+void DrmDriver::Flip(const uint8_t *buf)
+{
+    if (buff_.vaddr == MAP_FAILED) {
+        return;
+    }
+
+    if (useDoubleBuffer_) {
+        // 双缓冲：渲染到后台缓冲区
+        UiRotation::GetInstance().RotateBuffer(buf, backBuff_.vaddr, backBuff_.size);
+        
+        // 交换缓冲区
+        std::swap(buff_, backBuff_);
+        
+        // 设置新的前台缓冲区
+        drmModeSetCrtc(fd_, crtc_->crtc_id, buff_.fbId, 0, 0, &conn_->connector_id, 1, &conn_->modes[modeId]);
+    } else {
+        // 单缓冲：直接渲染到前台缓冲区
+        UiRotation::GetInstance().RotateBuffer(buf, buff_.vaddr, buff_.size);
+    }
+}
+
+int DrmDriver::DrmInit(void)
+{
+    // ... 现有代码 ...
+    
+    // 检查是否需要双缓冲
+    auto& rotation = UiRotation::GetInstance();
+    UI_ROTATION_DEGREE degree = rotation.GetDegree();
+    useDoubleBuffer_ = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                        degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+    
+    // 创建缓冲区
+    buff_.width = conn_->modes[modeId].hdisplay;
+    buff_.height = conn_->modes[modeId].vdisplay;
+    ModesetCreateFb(&buff_);
+    
+    if (useDoubleBuffer_) {
+        // 创建后台缓冲区
+        backBuff_.width = buff_.width;
+        backBuff_.height = buff_.height;
+        ModesetCreateFb(&backBuff_);
+    }
+    
+    // ... 现有代码 ...
+}
+```
+
+#### 7. fbdev_driver.cpp
+实现双缓冲逻辑：
+```cpp
+// fbdev_driver.cpp
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+    
+    // 检查是否需要双缓冲
+    auto& rotation = UiRotation::GetInstance();
+    UI_ROTATION_DEGREE degree = rotation.GetDegree();
+    bool useDoubleBuffer = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                           degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+    
+    if (useDoubleBuffer) {
+        // 双缓冲：渲染到虚拟后台缓冲区
+        static std::vector<uint8_t> backBuffer(buff_.size);
+        UiRotation::GetInstance().RotateBuffer(buf, backBuffer.data(), buff_.size);
+        
+        // 复制到物理缓冲区
+        memcpy(buff_.vaddr, backBuffer.data(), buff_.size);
+    } else {
+        // 单缓冲：直接渲染
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t*>(buff_.vaddr), buff_.size);
+    }
+    
+    if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+        LOG(ERROR) << "failed to display fb0!";
+    }
+}
+```
+
+### 总结：
+1. **双缓冲条件**：当旋转角度为90°或180°时启用双缓冲
+2. **DRM驱动**：
+   - 创建两个framebuffer对象
+   - 渲染到后台缓冲区
+   - 通过`drmModeSetCrtc`切换前台缓冲区
+3. **FBDEV驱动**：
+   - 使用内存中的后台缓冲区
+   - 渲染完成后复制到物理缓冲区
+4. **GraphicEngine**：
+   - 根据旋转角度决定是否使用双缓冲
+   - 在flush时执行缓冲区交换
+
+> 注意：以上代码为示例，实际实现时需要根据具体框架调整内存管理和错误处理逻辑。双缓冲能有效解决旋转时的画面撕裂问题，但会增加内存使用量和复制开销。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+我将专注于在FBDEV驱动中实现双缓冲逻辑，仅在旋转角度为90°或180°时使用双缓冲。以下是具体修改方案：
+
+### 修改思路：
+1. 在`FbdevDriver`类中添加双缓冲相关成员
+2. 修改`Init()`方法初始化双缓冲
+3. 修改`Flip()`方法实现双缓冲渲染
+4. 修改`ReleaseFb()`方法释放双缓冲资源
+
+### 具体修改：
+
+#### 1. fbdev_driver.h
+```cpp
+// fbdev_driver.h
+class FbdevDriver : public GraphicDrv {
+private:
+    // ... 现有成员 ...
+    void *backBuffer_ = nullptr;  // 新增：后台缓冲区
+    size_t backBufferSize_ = 0;   // 新增：后台缓冲区大小
+    bool useDoubleBuffer_ = false;// 新增：是否使用双缓冲
+};
+```
+
+#### 2. fbdev_driver.cpp
+```cpp
+// fbdev_driver.cpp
+bool FbdevDriver::Init()
+{
+    // ... 现有初始化代码 ...
+    
+    // 检查旋转角度是否需要双缓冲
+    auto& rotation = UiRotation::GetInstance();
+    UI_ROTATION_DEGREE degree = rotation.GetDegree();
+    useDoubleBuffer_ = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                       degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+    
+    if (useDoubleBuffer_) {
+        // 分配后台缓冲区
+        backBufferSize_ = finfo_.smem_len;
+        backBuffer_ = malloc(backBufferSize_);
+        if (!backBuffer_) {
+            LOG(ERROR) << "Failed to allocate back buffer";
+            munmap(buff_.vaddr, finfo_.smem_len);
+            close(fd);
+            return false;
+        }
+        LOG(INFO) << "Using double buffering for rotation";
+    }
+    
+    // ... 其他初始化代码 ...
+    return true;
+}
+
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+    
+    if (useDoubleBuffer_) {
+        // 双缓冲模式：
+        // 1. 渲染到后台缓冲区
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t*>(backBuffer_), buff_.size);
+        
+        // 2. 复制到前台缓冲区
+        memcpy(buff_.vaddr, backBuffer_, buff_.size);
+    } else {
+        // 单缓冲模式：直接渲染到前台缓冲区
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t*>(buff_.vaddr), buff_.size);
+    }
+    
+    if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+        LOG(ERROR) << "failed to display fb0!";
+    }
+}
+
+void FbdevDriver::ReleaseFb(const struct FbBufferObject *fbo)
+{
+    /* ... 现有释放代码 ... */
+    
+    // 释放后台缓冲区
+    if (backBuffer_) {
+        free(backBuffer_);
+        backBuffer_ = nullptr;
+        backBufferSize_ = 0;
+    }
+}
+```
+
+#### 3. ui_rotation.cpp
+确保在`InitRotation`中正确设置旋转角度：
+```cpp
+// ui_rotation.cpp
+void UiRotation::SetDegree(UI_ROTATION_DEGREE degree)
+{
+    degree_ = degree;
+    LOG(INFO) << "Rotation degree set to " << static_cast<int>(degree);
+}
+```
+
+#### 4. graphic_engine.cpp
+在初始化时设置旋转角度：
+```cpp
+// graphic_engine.cpp
+void GraphicEngine::Init(uint32_t bkgColor, uint8_t mode, const char *fontPath)
+{
+    // ... 现有代码 ...
+    
+    // 设置旋转角度（示例值，实际应从配置获取）
+    UiRotation::GetInstance().SetDegree(UI_ROTATION_DEGREE::UI_ROTATION_90);
+    
+    // ... 其他初始化代码 ...
+}
+```
+
+### 实现说明：
+1. **双缓冲条件**：当旋转角度为90°或180°时启用双缓冲
+2. **内存管理**：
+   - 前台缓冲区：通过`mmap`映射的framebuffer内存
+   - 后台缓冲区：通过`malloc`分配的系统内存
+3. **渲染流程**：
+   - 双缓冲模式：应用渲染 → 后台缓冲区 → 复制到前台缓冲区 → 显示
+   - 单缓冲模式：应用渲染 → 前台缓冲区 → 显示
+4. **资源释放**：在`ReleaseFb`中确保释放后台缓冲区内存
+
+### 使用示例：
+```cpp
+// 在主初始化代码中设置旋转角度
+UiRotation::GetInstance().SetDegree(UI_ROTATION_DEGREE::UI_ROTATION_90);
+
+// 初始化图形引擎
+GraphicEngine::GetInstance().Init(0x000000, OHOS::ARGB8888, "/system/fonts");
+```
+
+### 性能考虑：
+1. 双缓冲会增加内存使用（额外一个framebuffer大小的内存）
+2. 双缓冲会增加一次内存复制操作（从后台缓冲区到前台缓冲区）
+3. 对于90°旋转，双缓冲可以避免画面撕裂；对于0°和270°旋转，使用单缓冲保持性能
+
+这个实现保持了原有架构的简洁性，仅在FBDEV驱动中增加了必要的双缓冲逻辑，同时通过旋转角度自动切换单/双缓冲模式，确保在需要时提供更好的显示效果。
