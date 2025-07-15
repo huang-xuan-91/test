@@ -1,0 +1,466 @@
+为了在现有的单缓冲显示逻辑基础上增加双缓冲显示逻辑，并且根据 `rotation` 属性（90 或 180 度）来决定使用双缓冲还是单缓冲，我们将主要对 `FbdevDriver` 类进行修改。以下是实现步骤和修改后的代码：
+
+### 实现思路
+1. **添加双缓冲支持**：在 `FbdevDriver` 类中添加第二个缓冲区，并在需要时进行管理。
+2. **根据旋转角度选择缓冲模式**：在初始化和翻转操作中，根据旋转角度决定使用单缓冲还是双缓冲。
+
+### 修改后的代码
+
+#### `fbdev_driver.h`
+```cpp
+/*
+ * Copyright (c) 2022 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef UPDATER_UI_FBDEV_DRIVER_H
+#define UPDATER_UI_FBDEV_DRIVER_H
+
+#include <cstdint>
+#include <linux/fb.h>
+#include <string>
+#include "graphic_drv.h"
+#include "macros_updater.h"
+#include "updater_ui_const.h"
+#include "ui_rotation.h"
+
+namespace Updater {
+struct FbBufferObject {
+    uint32_t width {};
+    uint32_t height {};
+    uint32_t size {};
+    void *vaddr {};
+};
+
+class FbdevDriver : public GraphicDrv {
+    DISALLOW_COPY_MOVE(FbdevDriver);
+    using FbBlankHook = std::function<void(int, bool)>;
+    using FbBrightnessHook = std::function<void(const std::string &devPath, bool blank)>;
+public:
+    FbdevDriver() = default;
+    ~FbdevDriver() override;
+    bool Init() override;
+    void Flip(const uint8_t *buf) override;
+    void GetGrSurface(GrSurface &surface) override;
+    void Blank(bool blank) override;
+    void Exit(void) override;
+    static void SetDevPath(const std::string &devPath);
+    static void RegisterBlankHook(FbBlankHook blankHook);
+    static void RegisterBrightnessHook(FbBrightnessHook brightness);
+private:
+    void FBLog() const;
+    void ReleaseFb(const struct FbBufferObject *fbo);
+    struct FbBufferObject buff_ {};
+    struct FbBufferObject buff2_ {}; // 第二个缓冲区
+    struct fb_fix_screeninfo finfo_ {};
+    struct fb_var_screeninfo vinfo_ {};
+    bool FbPowerContrl(int fd, bool powerOn);
+    static inline std::string devPath_ = FB_DEV_PATH;
+    static inline FbBlankHook blankHook_ {};
+    static inline FbBrightnessHook brightnessHook_ {};
+    bool useDoubleBuffer_ = false; // 是否使用双缓冲
+    int currentBuffer_ = 0; // 当前使用的缓冲区
+};
+} // namespace Updater
+#endif
+```
+
+#### `fbdev_driver.cpp`
+```cpp
+/*
+ * Copyright (c) 2022 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "fbdev_driver.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include "log/log.h"
+#include "securec.h"
+#include "ui_rotation.h"
+#include "updater_ui_const.h"
+
+namespace Updater {
+FbdevDriver::~FbdevDriver()
+{
+    ReleaseFb(&buff_);
+    if (useDoubleBuffer_) {
+        ReleaseFb(&buff2_);
+    }
+}
+
+void FbdevDriver::FBLog() const
+{
+    LOG(INFO) << "id=" << finfo_.id;
+    LOG(INFO) << "sem_start=" << finfo_.smem_start;
+    LOG(INFO) << "smem_len=" << finfo_.smem_len;
+    LOG(INFO) << "type=" << finfo_.type;
+    LOG(INFO) << "line_length=" << finfo_.line_length;
+    LOG(INFO) << "mmio_start=" << finfo_.mmio_start;
+    LOG(INFO) << "mmio_len=" << finfo_.mmio_len;
+    LOG(INFO) << "visual=" << finfo_.visual;
+
+    LOG(INFO) << "The xres=" << vinfo_.xres;
+    LOG(INFO) << "The yres=" << vinfo_.yres;
+    LOG(INFO) << "xres_virtual=" << vinfo_.xres_virtual;
+    LOG(INFO) << "yres_virtual=" << vinfo_.yres_virtual;
+    LOG(INFO) << "xoffset=" << vinfo_.xoffset;
+    LOG(INFO) << "yoffset=" << vinfo_.yoffset;
+    LOG(INFO) << "bits_per_pixel is :" << vinfo_.bits_per_pixel;
+    LOG(INFO) << "red.offset=" << vinfo_.red.offset;
+    LOG(INFO) << "red.length=" << vinfo_.red.length;
+    LOG(INFO) << "red.msb_right=" << vinfo_.red.msb_right;
+    LOG(INFO) << "green.offset=" << vinfo_.green.offset;
+    LOG(INFO) << "green.length=" << vinfo_.green.length;
+    LOG(INFO) << "green.msb_right=" << vinfo_.green.msb_right;
+    LOG(INFO) << "blue.offset=" << vinfo_.blue.offset;
+    LOG(INFO) << "blue.length=" << vinfo_.blue.length;
+    LOG(INFO) << "blue.msb_right=" << vinfo_.blue.msb_right;
+    LOG(INFO) << "transp.offset=" << vinfo_.transp.offset;
+    LOG(INFO) << "transp.length=" << vinfo_.transp.length;
+    LOG(INFO) << "transp.msb_right=" << vinfo_.transp.msb_right;
+    LOG(INFO) << "height=" << vinfo_.height;
+}
+
+bool FbdevDriver::Init()
+{
+    if (devPath_.empty()) {
+        LOG(ERROR) << "dev path is empty, init failed, check whether SetDevPath correctly called";
+        return false;
+    }
+    int fd = open(devPath_.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "cannot open fb0";
+        return false;
+    }
+
+    (void)FbPowerContrl(fd, false);
+    (void)FbPowerContrl(fd, true);
+
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &finfo_) < 0) {
+        LOG(ERROR) << "failed to get fb0 info";
+        close(fd);
+        return false;
+    }
+
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &vinfo_) < 0) {
+        LOG(ERROR) << "failed to get fb0 info";
+        close(fd);
+        return false;
+    }
+
+    FBLog();
+
+    buff_.width = vinfo_.xres;
+    buff_.height = vinfo_.yres;
+    buff_.size = finfo_.line_length * vinfo_.yres;
+    buff_.vaddr = mmap(nullptr, finfo_.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (buff_.vaddr == MAP_FAILED) {
+        LOG(ERROR) << "failed to mmap framebuffer";
+        close(fd);
+        return false;
+    }
+    (void)memset_s(buff_.vaddr, finfo_.smem_len, 0, finfo_.smem_len);
+
+    // 根据旋转角度决定是否使用双缓冲
+    auto degree = UiRotation::GetInstance().GetDegree();
+    if (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || degree == UI_ROTATION_DEGREE::UI_ROTATION_180) {
+        useDoubleBuffer_ = true;
+        buff2_.width = vinfo_.xres;
+        buff2_.height = vinfo_.yres;
+        buff2_.size = finfo_.line_length * vinfo_.yres;
+        buff2_.vaddr = mmap(nullptr, finfo_.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (buff2_.vaddr == MAP_FAILED) {
+            LOG(ERROR) << "failed to mmap second framebuffer";
+            ReleaseFb(&buff_);
+            close(fd);
+            return false;
+        }
+        (void)memset_s(buff2_.vaddr, finfo_.smem_len, 0, finfo_.smem_len);
+    }
+
+    fd_ = fd;
+    return true;
+}
+
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+
+    if (useDoubleBuffer_) {
+        struct FbBufferObject *current = (currentBuffer_ == 0) ? &buff_ : &buff2_;
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(current->vaddr), current->size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+        currentBuffer_ = (currentBuffer_ + 1) % 2; // 切换缓冲区
+    } else {
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(buff_.vaddr), buff_.size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+    }
+}
+
+void FbdevDriver::GetGrSurface(GrSurface &surface)
+{
+    surface.height = static_cast<int>(vinfo_.yres);
+    surface.rowBytes = finfo_.line_length;
+    surface.pixelBytes = vinfo_.bits_per_pixel / 8; // 8: byte bit len
+    surface.width = static_cast<int>(surface.rowBytes / surface.pixelBytes);
+}
+
+void FbdevDriver::Blank(bool blank)
+{
+    FbPowerContrl(fd_, !blank);
+    if (blankHook_ != nullptr) {
+        blankHook_(fd_, blank);
+    }
+}
+
+void FbdevDriver::Exit(void)
+{
+    ReleaseFb(&buff_);
+    if (useDoubleBuffer_) {
+        ReleaseFb(&buff2_);
+    }
+}
+
+void FbdevDriver::SetDevPath(const std::string &devPath)
+{
+    devPath_ = devPath;
+}
+
+void FbdevDriver::RegisterBlankHook(FbBlankHook blankHook)
+{
+    blankHook_ = blankHook;
+}
+
+void FbdevDriver::RegisterBrightnessHook(FbBrightnessHook brightness)
+{
+    brightnessHook_ = brightness;
+}
+
+void FbdevDriver::ReleaseFb(const struct FbBufferObject *fbo)
+{
+    /*
+     * When fd_ isn't less than 0, then fbo->vaddr is valid and can by safely munmap.
+     * this can be guaranteed by FbdevDriver::Init.
+     */
+    if (fd_ < 0) {
+        return;
+    }
+    munmap(fbo->vaddr, fbo->size);
+    close(fd_);
+    fd_ = -1;
+}
+
+bool FbdevDriver::FbPowerContrl(int fd, bool powerOn)
+{
+    if (fd < 0) {
+        return false;
+    }
+    if (ioctl(fd, FBIOBLANK, powerOn ? FB_BLANK_UNBLANK : FB_BLANK_POWERDOWN) < 0) {
+        LOG(ERROR) << "failed to set fb0 power " << powerOn;
+        return false;
+    }
+    if (brightnessHook_ != nullptr) {
+        brightnessHook_(devPath_, powerOn);
+    }
+    return true;
+}
+} // namespace Updater
+```
+
+### 代码解释
+1. **添加第二个缓冲区**：在 `FbdevDriver` 类中添加了 `buff2_` 作为第二个缓冲区，并添加了 `useDoubleBuffer_` 和 `currentBuffer_` 来管理双缓冲模式。
+2. **初始化时判断缓冲模式**：在 `Init` 函数中，根据 `UiRotation` 的旋转角度决定是否使用双缓冲。如果旋转角度为 90 或 180 度，则分配第二个缓冲区。
+3. **翻转操作**：在 `Flip` 函数中，根据 `useDoubleBuffer_` 的值决定使用单缓冲还是双缓冲。如果使用双缓冲，则在每次翻转时切换当前使用的缓冲区。
+
+通过以上修改，系统可以根据旋转角度自动选择单缓冲或双缓冲模式。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+在实现双缓冲显示逻辑时，有多种方法可以用来管理双缓冲区，以下结合已有的代码和常见的编程实践，介绍几种可行的管理方法：
+
+### 1. 缓冲区切换法
+这种方法是最常见的双缓冲区管理方式，通过一个变量来记录当前正在使用的缓冲区，每次更新屏幕时切换到另一个缓冲区。
+
+#### 代码示例
+在 `FbdevDriver` 类中添加一个成员变量来记录当前使用的缓冲区：
+```cpp
+class FbdevDriver : public GraphicDrv {
+    // ... 其他成员 ...
+private:
+    struct FbBufferObject buff_ {};
+    struct FbBufferObject buff2_ {};
+    bool useDoubleBuffer_ = false;
+    int currentBuffer_ = 0; // 0 表示 buff_，1 表示 buff2_
+    // ... 其他成员 ...
+};
+```
+
+在 `Flip` 函数中进行缓冲区切换：
+```cpp
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+
+    if (useDoubleBuffer_) {
+        struct FbBufferObject *current = (currentBuffer_ == 0) ? &buff_ : &buff2_;
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(current->vaddr), current->size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+        currentBuffer_ = (currentBuffer_ + 1) % 2; // 切换缓冲区
+    } else {
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(buff_.vaddr), buff_.size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+    }
+}
+```
+
+### 2. 前后缓冲区标记法
+将一个缓冲区标记为前缓冲区（用于显示），另一个标记为后缓冲区（用于绘制）。每次绘制完成后，交换前后缓冲区的标记。
+
+#### 代码示例
+```cpp
+class FbdevDriver : public GraphicDrv {
+    // ... 其他成员 ...
+private:
+    struct FbBufferObject frontBuffer_ {};
+    struct FbBufferObject backBuffer_ {};
+    bool useDoubleBuffer_ = false;
+    // ... 其他成员 ...
+};
+
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+
+    if (useDoubleBuffer_) {
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(backBuffer_.vaddr), backBuffer_.size);
+        // 交换前后缓冲区
+        std::swap(frontBuffer_, backBuffer_);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+    } else {
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(buff_.vaddr), buff_.size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+    }
+}
+```
+
+### 3. 信号量或互斥锁同步法
+使用信号量或互斥锁来确保在绘制和显示操作时不会同时访问同一个缓冲区，避免数据竞争。
+
+#### 代码示例
+```cpp
+#include <mutex>
+
+class FbdevDriver : public GraphicDrv {
+    // ... 其他成员 ...
+private:
+    struct FbBufferObject buff_ {};
+    struct FbBufferObject buff2_ {};
+    bool useDoubleBuffer_ = false;
+    int currentBuffer_ = 0;
+    std::mutex bufferMutex_; // 互斥锁
+    // ... 其他成员 ...
+};
+
+void FbdevDriver::Flip(const uint8_t *buf)
+{
+    if (fd_ < 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(bufferMutex_); // 加锁
+
+    if (useDoubleBuffer_) {
+        struct FbBufferObject *current = (currentBuffer_ == 0) ? &buff_ : &buff2_;
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(current->vaddr), current->size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+        currentBuffer_ = (currentBuffer_ + 1) % 2;
+    } else {
+        UiRotation::GetInstance().RotateBuffer(buf, static_cast<uint8_t *>(buff_.vaddr), buff_.size);
+        if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+            LOG(ERROR) << "failed to display fb0!";
+        }
+    }
+}
+```
+
+### 总结
+- **缓冲区切换法**：简单直接，通过一个变量来控制缓冲区的切换，适用于大多数场景。
+- **前后缓冲区标记法**：逻辑清晰，通过交换前后缓冲区的标记来实现双缓冲，易于理解和维护。
+- **信号量或互斥锁同步法**：在多线程环境下使用，确保缓冲区的访问是线程安全的，避免数据竞争。
+
+根据具体的需求和场景，可以选择合适的双缓冲区管理方法。
