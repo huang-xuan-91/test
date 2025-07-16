@@ -1,0 +1,153 @@
+你的需求是：
+
+- 当前的updater底层只支持单buffer显示。
+- 你希望**只有在rotation=90或180**时，才启用“双buffer”，即切换待送显的buffer首地址（注意：不是平时的ping-pong机制，只是在特定旋转角度下用双buffer，其他角度还是单buffer）。
+
+下面给出你需要的**设计实现方案**，并结合你现有代码的实际结构给具体建议。
+
+---
+
+## 1. 数据结构准备
+
+建议在 `GraphicEngine` 里，针对双buffer，管理两份 Framebuffer 的虚拟地址。例如：
+
+```cpp
+class GraphicEngine {
+    ...
+    void* bufferA_ = nullptr;
+    void* bufferB_ = nullptr;
+    void* curDrawBuffer_ = nullptr;      // 当前可用于绘制的buffer
+    bool useDoubleBuffer_ = false;
+    bool isBufferAActive_ = true;        // 标识当前正在显示哪一个
+    ...
+};
+```
+
+## 2. 初始化双buffer
+
+在设备初始化时，如果需要双buffer，分配两块内存，并做好buffer指针切换。否则只分配一块。
+
+你可以在 `GraphicEngine` 的初始化流程里（通常会调`sfDev_->Init()`），根据rotation属性设置useDoubleBuffer_并分配buffer。
+
+例如：
+
+```cpp
+void GraphicEngine::Init(...)
+{
+    ...
+    useDoubleBuffer_ = (rotation == 90 || rotation == 180);
+    if (useDoubleBuffer_) {
+        bufferA_ = ... // 分配bufferA
+        bufferB_ = ... // 分配bufferB
+        curDrawBuffer_ = bufferA_;
+    } else {
+        bufferA_ = ... // 分配bufferA
+        curDrawBuffer_ = bufferA_;
+    }
+    ...
+}
+```
+
+## 3. 每次Flush时切换显示buffer
+
+**在rotation=90或180时**，Flush时交换buffer首地址；否则还是单buffer输出。
+
+你的Flush大致实现类似：
+
+```cpp
+void GraphicEngine::Flush(const OHOS::Rect& flushRect)
+{
+    std::lock_guard<std::mutex> lock{mtx_};
+    UiRotation::GetInstance().SetFlushRange(flushRect);
+
+    if (useDoubleBuffer_) {
+        // 交替切换绘制buffer
+        curDrawBuffer_ = isBufferAActive_ ? bufferB_ : bufferA_;
+        isBufferAActive_ = !isBufferAActive_;
+
+        // 这里绘制时记得用curDrawBuffer_
+        // ...
+        // Flip时将curDrawBuffer_送显
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(curDrawBuffer_));
+    } else {
+        // 单buffer流程
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(bufferA_));
+    }
+}
+```
+
+> ⚠️注意：你如果代码里还有“所有UI绘制都写死使用buffInfo_->virAddr”，则需要让绘制/拷贝逻辑通用curDrawBuffer_变量。
+
+## 4. 注意点
+
+- framebuffer物理上可能不支持mapping多块，如果是自己的内存，中间还需要对接一次memcpy到fb；如果fb支持多pages，则分两次mmap。
+- 你还要注意`RotateBuffer`的逻辑，拷贝目标要用curDrawBuffer_而不是写死某个buffer。
+- 在开关rotation属性时，比如UI旋转变化时，要适时re-init buffer、清零贴图等。
+
+## 5. Buffer分配与释放
+
+初始化分配、析构释放，防止内存泄漏。
+
+---
+
+## 伪代码能直接改动的点（结合你文件名、类结构）：
+
+### graphic_engine.cpp 增加双buffer成员
+
+```cpp
+// 添加新成员
+void* bufferA_ = nullptr;
+void* bufferB_ = nullptr;
+void* curDrawBuffer_ = nullptr;
+bool useDoubleBuffer_ = false;
+bool isBufferAActive_ = true;
+
+// 初始化（Init阶段）
+useDoubleBuffer_ = (UiRotation::GetInstance().GetDegree() == 90 ||
+                    UiRotation::GetInstance().GetDegree() == 180);
+if (useDoubleBuffer_) {
+    bufferA_ = malloc(bufferSize);
+    bufferB_ = malloc(bufferSize);
+    curDrawBuffer_ = bufferA_;
+} else {
+    bufferA_ = malloc(bufferSize);
+    curDrawBuffer_ = bufferA_;
+}
+```
+
+### Flush时接口
+
+```cpp
+void GraphicEngine::Flush(const OHOS::Rect& flushRect) {
+    ...
+    if (useDoubleBuffer_) {
+        // 切换buffer，准备下一帧
+        curDrawBuffer_ = isBufferAActive_ ? bufferB_ : bufferA_;
+        isBufferAActive_ = !isBufferAActive_;
+        // 绘制到curDrawBuffer_，然后送显
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(curDrawBuffer_));
+    } else {
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(bufferA_));
+    }
+}
+```
+
+### RotateBuffer修改（ui_rotation.cpp）
+
+```cpp
+// 这里的dstBuf参数传入curDrawBuffer_
+UiRotation::RotateBuffer(origBuf, (uint8_t*)curDrawBuffer_, bufferSize);
+```
+
+---
+
+## 总结
+
+1. 你只需要在rotation为90/180时，Flush时切换buffer首地址，实现“伪双buffer”。
+2. 你的绘制、旋转拷贝等地方，都要尽量不写死单一buffer地址，要支持curDrawBuffer_。
+3. 其他旋转角度还是保持单buffer模式。
+4. 注意内存的申请、释放与异常保护。
+
+---
+
+如需更具体的代码示例（比如直接给出某个函数内容），请告知你希望改动的文件/类/函数名和你实际项目的buffer分配方式！

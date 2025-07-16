@@ -1,0 +1,550 @@
+根据需求，我们需要在现有代码基础上增加双buffer显示逻辑，主要针对旋转90度或180度的情况。以下是实现方案：
+
+1. 首先需要在GraphicDrv接口中增加双buffer相关方法：
+// 在graphic_drv.h中修改
+class GraphicDrv {
+public:
+    // ... 原有方法 ...
+    virtual void SetDoubleBufferMode(bool enable) = 0; // 新增方法
+    virtual void SwapBuffer() = 0; // 新增方法
+};
+
+
+2. 在FbdevDriver中实现双buffer逻辑：
+// 在fbdev_driver.h中修改
+class FbdevDriver : public GraphicDrv {
+    // ... 原有代码 ...
+    void SetDoubleBufferMode(bool enable) override;
+    void SwapBuffer() override;
+private:
+    struct FbBufferObject backBuff_ {}; // 新增后台缓冲区
+    bool doubleBufferEnabled_ {false}; // 双buffer标志
+};
+
+// 在fbdev_driver.cpp中实现
+bool FbdevDriver::Init() {
+    // ... 原有初始化代码 ...
+    
+    // 初始化后台缓冲区
+    if (doubleBufferEnabled_) {
+        backBuff_.width = vinfo_.xres;
+        backBuff_.height = vinfo_.yres;
+        backBuff_.size = finfo_.line_length * vinfo_.yres;
+        backBuff_.vaddr = malloc(backBuff_.size); // 使用malloc分配内存
+        if (backBuff_.vaddr == nullptr) {
+            LOG(ERROR) << "Failed to allocate back buffer";
+            return false;
+        }
+        (void)memset_s(backBuff_.vaddr, backBuff_.size, 0, backBuff_.size);
+    }
+    
+    return true;
+}
+
+void FbdevDriver::SetDoubleBufferMode(bool enable) {
+    doubleBufferEnabled_ = enable;
+    if (enable && backBuff_.vaddr == nullptr) {
+        backBuff_.width = vinfo_.xres;
+        backBuff_.height = vinfo_.yres;
+        backBuff_.size = finfo_.line_length * vinfo_.yres;
+        backBuff_.vaddr = malloc(backBuff_.size);
+        if (backBuff_.vaddr != nullptr) {
+            (void)memset_s(backBuff_.vaddr, backBuff_.size, 0, backBuff_.size);
+        }
+    }
+}
+
+void FbdevDriver::SwapBuffer() {
+    if (!doubleBufferEnabled_ || backBuff_.vaddr == nullptr) {
+        return;
+    }
+    
+    // 交换前后缓冲区
+    std::swap(buff_.vaddr, backBuff_.vaddr);
+}
+
+void FbdevDriver::Flip(const uint8_t *buf) {
+    if (fd_ < 0) {
+        return;
+    }
+    
+    auto& uiRotation = UiRotation::GetInstance();
+    auto degree = uiRotation.GetDegree(); // 需要先在UiRotation中添加GetDegree方法
+    
+    if (doubleBufferEnabled_ && (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                                degree == UI_ROTATION_DEGREE::UI_ROTATION_180)) {
+        // 双buffer模式且需要旋转时，先渲染到后台缓冲区
+        uiRotation.RotateBuffer(buf, static_cast<uint8_t*>(backBuff_.vaddr), backBuff_.size);
+        SwapBuffer(); // 交换缓冲区
+    } else {
+        // 单buffer模式或不需要旋转时，直接渲染到前台缓冲区
+        uiRotation.RotateBuffer(buf, static_cast<uint8_t*>(buff_.vaddr), buff_.size);
+    }
+    
+    if (ioctl(fd_, FBIOPAN_DISPLAY, &vinfo_) < 0) {
+        LOG(ERROR) << "failed to display fb0!";
+    }
+}
+
+void FbdevDriver::Exit(void) {
+    ReleaseFb(&buff_);
+    if (backBuff_.vaddr != nullptr) {
+        free(backBuff_.vaddr);
+        backBuff_.vaddr = nullptr;
+    }
+}
+
+
+3. 在UiRotation中添加获取旋转角度的方法：
+// 在ui_rotation.h中修改
+class UiRotation {
+public:
+    // ... 原有方法 ...
+    UI_ROTATION_DEGREE GetDegree() const { return degree_; } // 新增方法
+};
+
+
+4. 在SurfaceDev中初始化时设置双buffer模式：
+// 在surface_dev.cpp中修改
+bool SurfaceDev::Init() {
+    drv_ = MakeDevDrv(GetDevType());
+    if (drv_ != nullptr) {
+        // 根据旋转角度决定是否启用双buffer
+        auto degree = UiRotation::GetInstance().GetDegree();
+        bool needDoubleBuffer = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                               degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+        drv_->SetDoubleBufferMode(needDoubleBuffer);
+        return drv_->Init();
+    }
+    return false;
+}
+
+
+5. 在GraphicEngine中处理双buffer逻辑：
+// 在graphic_engine.cpp中修改
+void GraphicEngine::Flush(const OHOS::Rect& flushRect) {
+    if ((sfDev_ == nullptr) || (buffInfo_ == nullptr)) {
+        LOG(ERROR) << "null error";
+        return;
+    }
+    std::lock_guard<std::mutex> lock {mtx_};
+    UiRotation::GetInstance().SetFlushRange(flushRect);
+    
+    // 如果是双buffer模式，这里会自动处理交换逻辑
+    sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+}
+
+
+这个实现方案的主要特点：
+
+1. 通过GraphicDrv接口扩展支持双buffer功能
+2. 在FbdevDriver中实现具体的双buffer逻辑，包括内存分配和交换
+3. 根据旋转角度自动决定是否启用双buffer
+4. 保持原有单buffer逻辑不变，确保兼容性
+5. 在需要旋转时使用双buffer减少性能损耗
+
+注意：需要在相关头文件中添加必要的包含和前置声明，以及处理内存分配失败的情况。此外，还需要考虑线程安全性，特别是在交换缓冲区时。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+为了支持双buffer显示，我们需要在GraphicEngine和相关的驱动类中进行修改。主要思路是：
+
+在GraphicEngine中，根据旋转角度决定使用单缓冲还是双缓冲。
+如果旋转角度为90或180度，则创建两个缓冲区，并在刷新时交换这两个缓冲区（即双缓冲）。
+否则，使用单缓冲。
+具体修改如下：
+
+一、GraphicEngine类修改：
+
+增加一个成员变量用于第二个缓冲区（双缓冲时使用）。
+修改GetFBBufferInfo方法，当需要双缓冲时，创建两个缓冲区，并返回当前使用的缓冲区。
+修改Flush方法，在双缓冲情况下，交换缓冲区并送显。
+二、在FlushThreadLoop中，双缓冲时可能需要额外处理（比如等待垂直同步等，但当前代码没有，所以暂时不考虑）。
+
+三、在GraphicEngine初始化时，根据旋转角度设置双缓冲标志。
+
+但是，注意文档9和文档10（UiRotation）中，旋转角度是通过UiRotation::GetInstance().SetDegree设置的。我们可以在GraphicEngine::Init中获取旋转角度，并决定是否使用双缓冲。
+
+然而，当前旋转角度是在GraphicEngine::GetFBBufferInfo中初始化的（通过调用UiRotation::GetInstance().InitRotation）。因此，我们可以在InitRotation之后判断旋转角度，然后决定是否使用双缓冲。
+
+但是，请注意，旋转角度是在GetFBBufferInfo中初始化的，而GetFBBufferInfo是在UI框架需要绘制时调用的。因此，我们需要在初始化缓冲区时（即GetFBBufferInfo中）决定是否使用双缓冲。
+
+具体步骤：
+
+在GraphicEngine类中增加成员变量：
+bool useDoubleBuffer_; // 标记是否使用双缓冲
+std::unique_ptr<uint8_t[]> virAddr2_; // 第二个缓冲区
+std::unique_ptr buffInfo2_; // 第二个缓冲区的BufferInfo
+int currentBuffer_; // 当前使用的缓冲区索引（0或1）
+修改GraphicEngine::GetFBBufferInfo：
+在初始化旋转（InitRotation）之后，判断旋转角度（通过UiRotation::GetInstance()获取当前角度），如果是90或180，则设置useDoubleBuffer_为true，否则false。
+如果useDoubleBuffer_为true，则创建两个缓冲区，并设置currentBuffer_为0，返回buffInfo_.get()（即第一个缓冲区）。
+如果为false，则按原单缓冲方式。
+修改GraphicEngine::Flush：
+如果使用双缓冲：
+- 将当前缓冲区的数据送显（通过sfDev_->Flip）
+- 交换缓冲区（currentBuffer_ = 1 - currentBuffer_，并更新buffInfo_和virAddr_指向当前缓冲区）
+注意：在双缓冲中，我们有两个缓冲区，每次绘制都是在后台缓冲区（非当前显示的那个）进行，绘制完后交换。
+注意：在双缓冲模式下，每次Flush后，我们交换了缓冲区，那么下次绘制的缓冲区就是另一个缓冲区了。但是，UI框架在绘制时是通过GetFBBufferInfo获取当前缓冲区的，所以我们需要在交换后更新buffInfo_和virAddr_指向当前用于绘制的缓冲区。
+但是，这里有一个问题：GraphicEngine的buffInfo_和virAddr_是unique_ptr，我们有两个缓冲区后，如何管理？
+
+我们可以这样：
+在双缓冲情况下：
+virAddr_ 和 virAddr2_ 分别指向两个缓冲区。
+buffInfo_ 和 buffInfo2_ 分别管理两个缓冲区的BufferInfo。
+currentBuffer_ 指示当前用于绘制的缓冲区（0表示第一个，1表示第二个）。
+
+每次GetFBBufferInfo返回的是当前用于绘制的缓冲区（即currentBuffer_指向的那个）。
+
+在Flush后，我们交换缓冲区（currentBuffer_切换），然后设置buffInfo_和virAddr_指向新的当前绘制缓冲区？不行，因为这两个指针是unique_ptr，管理两个独立的缓冲区。
+
+实际上，我们不需要让buffInfo_和virAddr_来回切换，因为我们在Flush时，需要知道当前送显的缓冲区是哪个，而绘制时使用的是GetFBBufferInfo返回的缓冲区（即当前绘制缓冲区）。我们可以这样：
+    - 绘制缓冲区：由GetFBBufferInfo返回，我们称为back buffer（后台缓冲区）。
+    - 显示缓冲区：是当前正在显示的，我们称为front buffer（前台缓冲区）。
+
+在Flush时，我们将back buffer的内容发送到显示设备，然后交换（让back buffer变成front buffer，而原来的front buffer变成新的back buffer）。
+
+但是，在GraphicEngine中，我们只有一个buffInfo_和virAddr_，它们一直指向当前用于绘制的缓冲区（back buffer）。而双缓冲的另一个缓冲区（front buffer）由另外的变量管理。所以我们需要两个BufferInfo和两个virAddr。
+
+因此，我们修改GraphicEngine类：
+
+  class GraphicEngine : public OHOS::SoftEngine {
+      ...
+  private:
+      ...
+      // 双缓冲相关
+      bool useDoubleBuffer_ {};
+      int currentBuffer_ {0}; // 0: 使用buffInfo_和virAddr_作为绘制缓冲区，buffInfo2_和virAddr2_作为显示缓冲区；1：反之
+      std::unique_ptr<OHOS::BufferInfo> buffInfo2_ {nullptr};
+      std::unique_ptr<uint8_t[]> virAddr2_ {nullptr};
+  };
+5. 修改GetFBBufferInfo：
+在初始化旋转后，判断旋转角度：
+UI_ROTATION_DEGREE degree = UiRotation::GetInstance().GetDegree();
+useDoubleBuffer_ = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+
+ 如果useDoubleBuffer_为true，则创建两个缓冲区：
+    - 第一个缓冲区：virAddr_ 和 buffInfo_（和原来一样）
+    - 第二个缓冲区：virAddr2_ 和 buffInfo2_（同样方式创建）
+
+ 注意：第二个缓冲区的创建方式和第一个一样，包括旋转后的宽高。
+
+ 然后，设置currentBuffer_为0，表示当前绘制缓冲区是第一个。
+
+ 返回buffInfo_.get()（即第一个缓冲区）。
+6. 修改Flush方法：
+在双缓冲情况下：
+- 根据currentBuffer_决定将哪个缓冲区送显：
+如果currentBuffer_为0，则送显第一个缓冲区（即virAddr_指向的数据），然后切换到第二个缓冲区作为绘制缓冲区（即让currentBuffer_变为1，并且将buffInfo_和virAddr_指向第二个缓冲区？这样不行，因为绘制缓冲区是通过GetFBBufferInfo返回的，而GetFBBufferInfo返回的是buffInfo_.get()，所以我们希望绘制缓冲区始终是buffInfo_和virAddr_管理的，而显示的是另一个）。
+
+ 这里我们改变一下思路：
+    我们保持绘制缓冲区（back buffer）始终是buffInfo_和virAddr_（这样就不需要修改GetFBBufferInfo的返回逻辑），而另一个缓冲区（front buffer）由buffInfo2_和virAddr2_管理。
+
+ 在Flush时：
+    将当前绘制缓冲区（即buffInfo_）的内容复制到显示缓冲区（buffInfo2_）？但是这样会有一次内存拷贝，效率低。
+
+ 另一种做法：在Flush时，我们交换两个缓冲区的指针，然后送显之前绘制的缓冲区（即现在的buffInfo2_），而新的绘制仍然在buffInfo_（即原来的显示缓冲区，现在变成绘制缓冲区）。
+
+ 具体步骤：
+     if (useDoubleBuffer_) {
+         // 交换两个缓冲区
+         std::swap(buffInfo_, buffInfo2_);
+         std::swap(virAddr_, virAddr2_);
+         // 现在buffInfo_和virAddr_指向的是新的绘制缓冲区（即原来的显示缓冲区），而buffInfo2_和virAddr2_指向的是刚刚绘制完要送显的缓冲区
+         // 送显buffInfo2_指向的缓冲区
+         sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo2_->virAddr));
+     } else {
+         // 单缓冲直接送显
+         sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+     }
+
+ 但是，这样交换后，绘制缓冲区（buffInfo_）变成了之前的显示缓冲区，那么之前绘制的内容就被覆盖了？不对，双缓冲的目的是避免撕裂，我们绘制完一帧后，将绘制好的缓冲区送显，同时下一帧绘制到另一个缓冲区。所以，在交换后，下一帧的绘制应该在另一个缓冲区（即现在的buffInfo_）上。
+
+ 注意：在交换之前，我们已经在buffInfo_（绘制缓冲区）上绘制好了当前帧，交换后，buffInfo_变成了之前的显示缓冲区（即上一帧的），而buffInfo2_变成了当前帧的显示缓冲区。所以我们需要将绘制好的当前帧（在交换前的buffInfo_）送显，也就是交换后的buffInfo2_。
+
+ 但是，这样会导致一个问题：在第一次绘制时，我们有两个缓冲区，第一次绘制在buffInfo_（我们称为buffer0），然后交换，buffer0变成显示缓冲区（buffInfo2_指向它），而buffInfo_指向buffer1（新的绘制缓冲区）。然后，在第二次绘制时，我们在buffer1上绘制，然后交换，此时将buffer1送显，并将buffInfo_指向buffer0（新的绘制缓冲区）。这样交替。
+
+ 因此，在双缓冲初始化时，我们需要两个缓冲区都是初始化的（黑色背景），并且第一次绘制后，送显buffer0，然后交换，这样下一次绘制在buffer1。
+
+ 所以，修改Flush方法：
+
+    if (useDoubleBuffer_) {
+        // 交换前，当前绘制好的缓冲区在buffInfo_中
+        // 送显的是buffInfo2_（即上一帧的缓冲区）？不对，第一次绘制时，buffInfo2_是第二个缓冲区，还没有内容。
+        // 所以，我们应该送显当前绘制好的缓冲区（即buffInfo_），然后交换，这样下一帧绘制到另一个缓冲区。
+
+        // 但是，我们交换后，绘制缓冲区变成了另一个，所以我们需要将当前绘制好的内容送显，然后交换。
+        // 所以，这里应该送显buffInfo_（当前绘制好的），然后交换，这样下一帧就在另一个缓冲区上绘制。
+        // 所以，我们这样：
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+
+        // 交换缓冲区
+        std::swap(buffInfo_, buffInfo2_);
+        std::swap(virAddr_, virAddr2_);
+    } else {
+        sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+    }
+
+ 但是，这样会导致第一次绘制时，送显的是buffInfo_（buffer0），然后交换，buffInfo_指向buffer1，buffInfo2_指向buffer0。那么下一帧绘制时，GetFBBufferInfo返回的是buffInfo_（即buffer1），绘制在buffer1上，然后Flush时送显buffer1，然后交换，buffInfo_指向buffer0，buffInfo2_指向buffer1。如此循环。
+
+ 然而，第一次绘制时，buffer0被送显，然后交换，绘制缓冲区变为buffer1。但此时buffer1是初始化的黑色（或背景色），在第一次交换后，我们没有立即绘制，所以屏幕显示的是buffer0（第一帧），然后第二帧绘制在buffer1上，等第二帧绘制完成，再送显buffer1，交换，显示buffer1，绘制缓冲区变为buffer0。
+
+ 这样没有问题。
+7. 但是，这样修改后，在双缓冲情况下，每次Flush都会交换缓冲区。而单缓冲不会交换。
+
+另外，在GraphicEngine的构造函数中，需要初始化双缓冲相关的成员。
+在StopEngine时，可能需要将两个缓冲区都清除？目前不需要，因为析构时会自动释放。
+在GraphicEngine::Init中，我们并没有初始化双缓冲，因为双缓冲的初始化在GetFBBufferInfo中。
+注意：在双缓冲模式下，旋转操作（UiRotation::RotateBuffer）是在哪里调用的？
+在当前的代码中，旋转操作是在驱动层（FbdevDriver::Flip）中调用的：UiRotation::GetInstance().RotateBuffer(...)
+这个调用是在sfDev_->Flip中，而sfDev_->Flip最终调用FbdevDriver::Flip，然后调用RotateBuffer。 因此，我们需要确保在双缓冲模式下，两个缓冲区都要经过旋转？不需要，因为RotateBuffer函数内部会根据旋转角度旋转整个缓冲区（从origBuf旋转到dstBuf）。在双缓冲模式下，我们有两个缓冲区，每次送显的都是绘制好的缓冲区（即已经经过旋转的？不对，注意RotateBuffer的参数：origBuf是绘制的缓冲区（未经旋转），dstBuf是显示缓冲区的地址。在双缓冲模式下，我们交换后，送显的缓冲区是绘制好的，但是还没有旋转。 所以，问题在于：在双缓冲模式下，我们交换后，调用sfDev_->Flip，此时传入的是绘制缓冲区的地址（未经旋转），然后驱动层会调用RotateBuffer将绘制缓冲区旋转到显示缓冲区（即驱动层的FbBufferObject.vaddr）。但是，在双缓冲模式下，我们有两个系统缓冲区（由GraphicEngine管理），而驱动层的显示缓冲区只有一个（即FbdevDriver中的buff_.vaddr）。所以，RotateBuffer每次都会将系统缓冲区（origBuf）旋转到驱动层的显示缓冲区（dstBuf）。 因此，双缓冲在系统层（GraphicEngine）有两个缓冲区，但驱动层（FbdevDriver）只有一个显示缓冲区。所以，在双缓冲模式下，我们仍然需要将系统缓冲区旋转到驱动层的显示缓冲区。所以，双缓冲并没有减少旋转的开销。 那么，双缓冲在这里的作用是什么？避免撕裂。因为单缓冲时，我们正在绘制的时候，如果刷新率很高，可能会在绘制过程中被送显，导致屏幕撕裂。而双缓冲通过交换，可以确保每次送显的都是完整的一帧。 但是，在当前的旋转逻辑下，每次送显都要旋转整个缓冲区（从系统缓冲区到驱动缓冲区），所以双缓冲不能避免旋转的开销。 因此，我们保留旋转的逻辑，即仍然在驱动层的Flip中调用RotateBuffer。 所以，双缓冲的修改不影响旋转操作。
+修改GraphicEngine::Flush方法，注意加锁。因为Flush是在主线程中调用，而FlushThreadLoop在另一个线程中调用TaskHandler，但是修改缓冲区指针的操作需要加锁。 在GraphicEngine中已经有一个mutex（mtx_），我们在Flush方法中使用了这个锁。所以，在交换缓冲区时，我们需要在锁的保护下进行。 修改后的Flush方法： void GraphicEngine::Flush(const OHOS::Rect& flushRect)
+{
+if ((sfDev_ == nullptr) || (buffInfo_ == nullptr)) {
+LOG(ERROR) << "null error";
+return;
+}
+std::lock_guard lock {mtx_};
+UiRotation::GetInstance().SetFlushRange(flushRect);
+   if (useDoubleBuffer_) {
+       // 将当前绘制缓冲区（buffInfo_）送显（注意：这里会旋转到驱动层的显示缓冲区）
+       sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+       // 交换两个缓冲区
+       std::swap(buffInfo_, buffInfo2_);
+       std::swap(virAddr_, virAddr2_);
+   } else {
+       sfDev_->Flip(reinterpret_cast<uint8_t *>(buffInfo_->virAddr));
+   }
+}
+在GetFBBufferInfo中，初始化双缓冲的部分也需要加锁（因为可能被多个线程调用？）。但当前GetFBBufferInfo只在主线程调用，所以暂时不加锁。
+双缓冲的创建：在GetFBBufferInfo中，如果还没有初始化双缓冲，并且旋转角度需要双缓冲，则初始化第二个缓冲区。 修改后的GetFBBufferInfo： OHOS::BufferInfo *GraphicEngine::GetFBBufferInfo()
+{
+if (buffInfo_ != nullptr) {
+// 已经初始化过，直接返回当前绘制缓冲区（buffInfo_）
+return buffInfo_.get();
+}
+   ... // 原来的代码，计算pixelBytes，检查宽高
+
+   // 初始化旋转
+   UiRotation::GetInstance().InitRotation(width_, height_, pixelBytes);
+   width_ = UiRotation::GetInstance().GetWidth();
+   height_ = UiRotation::GetInstance().GetHeight();
+
+   // 判断旋转角度，决定是否使用双缓冲
+   UI_ROTATION_DEGREE degree = UiRotation::GetInstance().GetDegree();
+   useDoubleBuffer_ = (degree == UI_ROTATION_DEGREE::UI_ROTATION_90 || degree == UI_ROTATION_DEGREE::UI_ROTATION_180);
+
+   // 创建第一个缓冲区
+   uint32_t bufferSize = width_ * height_ * pixelBytes;
+   virAddr_ = std::make_unique<uint8_t[]>(bufferSize);
+   buffInfo_ = std::make_unique<OHOS::BufferInfo>();
+   // 初始化buffInfo_ ... （原来的代码）
+
+   // 如果使用双缓冲，创建第二个缓冲区
+   if (useDoubleBuffer_) {
+       virAddr2_ = std::make_unique<uint8_t[]>(bufferSize);
+       buffInfo2_ = std::make_unique<OHOS::BufferInfo>();
+       // 初始化buffInfo2_，内容与buffInfo_相同，除了virAddr
+       *buffInfo2_ = *buffInfo_; // 拷贝BufferInfo结构
+       buffInfo2_->virAddr = virAddr2_.get();
+       buffInfo2_->phyAddr = buffInfo2_->virAddr; // 注意：这里phyAddr我们设置为virAddr，因为是虚拟地址
+       // 将第二个缓冲区也清空
+       (void)memset_s(virAddr2_.get(), bufferSize, 0, bufferSize);
+   }
+
+   // 清空第一个缓冲区
+   (void)memset_s(virAddr_.get(), bufferSize, 0, bufferSize);
+
+   return buffInfo_.get();
+}
+注意：buffInfo2_的初始化是通过拷贝buffInfo_，然后修改virAddr和phyAddr。
+
+但是，在GraphicEngine的析构中，我们不需要修改，因为unique_ptr会自动释放。
+另外，在StopEngine时，我们不需要特殊处理双缓冲。
+在FlushThreadLoop中，当停止时，会清空屏幕。这里需要修改为清空当前绘制缓冲区（buffInfo_）？但是，在双缓冲模式下，我们有两个缓冲区，需要都清空吗？但是StopEngine后，程序可能退出，所以不必须。
+修改后，需要测试单缓冲和双缓冲情况。
+但是，注意：旋转180度的情况，在双缓冲时，我们有两个缓冲区，而旋转操作在驱动层（FbdevDriver）的Flip中。所以，每次Flip都会旋转整个缓冲区。因此，双缓冲模式下的性能可能不会提升，但可以避免撕裂。
+
+由于时间有限，我们只修改GraphicEngine类。
+
+但是，当前代码中，GraphicEngine::Flip中调用了sfDev_->Flip，而sfDev_->Flip会调用驱动的Flip，其中就包括旋转。所以，双缓冲模式下，每次Flip都要旋转整个缓冲区（从系统缓冲区到驱动缓冲区）。所以，双缓冲模式并不能避免旋转操作。
+
+如果希望优化旋转操作，可能需要将旋转操作提前到绘制时（比如在绘制每个元素时就旋转），但这涉及大量修改。因此，目前按上述方案实现双缓冲。
+
+具体修改文件：graphic_engine.h和graphic_engine.cpp（即文档1和文档5）
+
+注意：文档1是头文件，文档5是源文件。
+
+修改graphic_engine.h（文档1）：
+在GraphicEngine类中添加私有成员：
+
+    bool useDoubleBuffer_ {};
+    std::unique_ptr<OHOS::BufferInfo> buffInfo2_ {nullptr};
+    std::unique_ptr<uint8_t[]> virAddr2_ {nullptr};
+修改graphic_engine.cpp（文档5）：
+修改GetFBBufferInfo函数，在初始化旋转后，判断旋转角度，若为90或180，则设置useDoubleBuffer_为true，并创建第二个缓冲区。
+修改Flush函数，在useDoubleBuffer_为true时，先送显当前缓冲区（buffInfo_），然后交换buffInfo_和buffInfo2_，交换virAddr_和virAddr2_。
+
+但是，注意：在交换后，buffInfo_和virAddr_指向了第二个缓冲区，而buffInfo2_和virAddr2_指向了第一个缓冲区。这样，下次绘制时，GetFBBufferInfo返回的是buffInfo_（即第二个缓冲区），从而实现了双缓冲交替。
+
+下面给出修改后的代码段（在文档5中）：
+
+
+根据需求，我们需要在现有单缓冲设计基础上增加双缓冲支持，主要针对旋转90°或180°的场景。以下是具体实现方案：
+
+1. 修改图形引擎类（GraphicEngine）
+
+在graphic_engine.h中增加双缓冲相关成员：
+class GraphicEngine : public OHOS::SoftEngine {
+    // ... 现有代码 ...
+private:
+    // 新增双缓冲相关成员
+    bool useDoubleBuffer_ = false;
+    std::unique_ptr<uint8_t[]> backBuffer_ = nullptr; // 新增后台缓冲区
+    std::mutex bufferMutex_; // 新增缓冲区交换锁
+};
+
+
+在graphic_engine.cpp中修改关键方法：
+// 在初始化时检测旋转角度
+void GraphicEngine::Init(uint32_t bkgColor, uint8_t mode, const char* fontPath) {
+    // ... 现有初始化代码 ...
+
+    // 新增：根据旋转角度决定是否启用双缓冲
+    UI_ROTATION_DEGREE rotation = UiRotation::GetInstance().GetDegree();
+    useDoubleBuffer_ = (rotation == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                        rotation == UI_ROTATION_DEGREE::UI_ROTATION_180);
+}
+
+// 修改获取缓冲区方法
+OHOS::BufferInfo* GraphicEngine::GetFBBufferInfo() {
+    // ... 现有代码计算pixelBytes等...
+
+    // 修改：为双缓冲创建额外缓冲区
+    const uint32_t bufferSize = width_ * height_ * pixelBytes;
+    virAddr_ = std::make_unique<uint8_t[]>(bufferSize);
+    
+    if (useDoubleBuffer_) {
+        backBuffer_ = std::make_unique<uint8_t[]>(bufferSize);
+        memset(backBuffer_.get(), 0, bufferSize); // 初始化后台缓冲
+    }
+
+    // ... 现有BufferInfo初始化...
+}
+
+// 修改刷新方法
+void GraphicEngine::Flush(const OHOS::Rect& flushRect) {
+    std::lock_guard<std::mutex> lock {mtx_};
+    UiRotation::GetInstance().SetFlushRange(flushRect);
+
+    if (useDoubleBuffer_) {
+        std::lock_guard<std::mutex> bufLock(bufferMutex_);
+        // 交换前后台缓冲区指针
+        std::swap(virAddr_, backBuffer_);
+        // 更新BufferInfo指向新前台缓冲
+        buffInfo_->virAddr = virAddr_.get();
+        buffInfo_->phyAddr = virAddr_.get();
+        
+        // 送显后台缓冲（即刚绘制完成的缓冲）
+        sfDev_->Flip(reinterpret_cast<uint8_t*>(backBuffer_.get()));
+    } else {
+        sfDev_->Flip(reinterpret_cast<uint8_t*>(buffInfo_->virAddr));
+    }
+}
+
+
+2. 修改旋转模块（UiRotation）
+
+在ui_rotation.h中增加获取旋转角度方法：
+class UiRotation {
+public:
+    UI_ROTATION_DEGREE GetDegree() const { return degree_; }
+    // ... 其他现有方法 ...
+};
+
+
+3. 修改驱动接口（GraphicDrv）
+
+在graphic_drv.h中增加双缓冲支持声明：
+class GraphicDrv {
+public:
+    virtual void SetDoubleBuffer(bool enabled) {} // 新增双缓冲开关
+    // ... 其他现有方法 ...
+};
+
+
+在具体驱动实现（如fbdev_driver.cpp）中实现该方法：
+void FbdevDriver::SetDoubleBuffer(bool enabled) {
+    // 实际设备可能需要特殊处理，这里仅占位
+}
+
+
+4. 修改初始化流程
+
+在surface_dev.cpp中初始化时传递双缓冲标志：
+bool SurfaceDev::Init() {
+    drv_ = MakeDevDrv(GetDevType());
+    if (drv_) {
+        // 新增：根据旋转角度设置双缓冲
+        UI_ROTATION_DEGREE rotation = UiRotation::GetInstance().GetDegree();
+        bool needDoubleBuffer = (rotation == UI_ROTATION_DEGREE::UI_ROTATION_90 || 
+                                rotation == UI_ROTATION_DEGREE::UI_ROTATION_180);
+        drv_->SetDoubleBuffer(needDoubleBuffer);
+        return drv_->Init();
+    }
+    return false;
+}
+
+
+关键设计要点：
+
+1. 动态切换机制：
+   • 在GraphicEngine::Init()中根据当前旋转角度决定是否启用双缓冲
+
+   • 通过std::swap快速交换前后台缓冲区指针
+
+   • 保持单缓冲路径不变以保证兼容性
+
+2. 线程安全：
+   • 新增bufferMutex_确保缓冲区交换原子性
+
+   • 保持原有mtx_用于刷新操作同步
+
+3. 内存管理：
+   • 后台缓冲区(backBuffer_)仅在需要时创建
+
+   • 使用unique_ptr自动管理缓冲区生命周期
+
+4. 驱动扩展：
+   • 通过SetDoubleBuffer接口通知底层驱动
+
+   • 实际设备可根据需要实现特殊双缓冲逻辑
+
+此设计在保持现有架构不变的前提下，仅当检测到90°或180°旋转时启用双缓冲机制，通过交换缓冲区指针实现高效显示切换，避免了旋转操作可能引起的画面撕裂问题。
+
+
+
+
+
+
+
+
+
+
+
